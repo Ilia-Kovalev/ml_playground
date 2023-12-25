@@ -1,4 +1,3 @@
-
 from argparse import ArgumentParser
 import traceback
 
@@ -6,22 +5,21 @@ import numpy as np
 
 import gymnasium as gym
 from gymnasium import spaces
-from gymnasium.spaces.utils import flatten_space
+from gymnasium.wrappers import FlattenObservation, NormalizeObservation
 
-import rl.core
-import rl.memory
-import rl.agents
-import rl.policy
-import keras
+import tianshou as ts
+from tianshou.utils.net.common import Net
+import torch
+from torch.utils.tensorboard import SummaryWriter
 
 
 class _Deck:
     N_CARD_TYPES = 8
 
-    def __init__(self, type='Emerald'):
+    def __init__(self, type='Ruby'):
         n_numbered_cards = {
-            'Emerald': 10,
-            'Ruby': 9,
+            'Ruby': 10,
+            'Emerald': 9,
             'Diamond': 8,
         }[type]
 
@@ -71,40 +69,30 @@ class Game(gym.Env):
     N_ROWS = 8
     MAX_ROW_SIZE = N_ROWS
 
-    def __init__(self, deck_type='Emerald',
-                 n_rounds=1,
-                 disable_jackpot=False,
-                 training_reward=False):
+    def __init__(self, deck_type='Ruby'):
         self.action_space = spaces.Discrete(2)
-        self._n_rounds = n_rounds
-        self._disable_jackpot = disable_jackpot
-        self._training_reward = training_reward
 
         self._rows = self.N_ROWS * [[]]
 
-        max_reward = self.MAX_ROW_SIZE * \
-            sum(i * (i + 1) for i in range(1, self.N_ROWS - 1))
-        self.reward_range = (-15., max_reward)
-
         self._deck = _Deck(deck_type)
 
+        self.reward_range = (-15, self.MAX_ROW_SIZE *
+                             sum(i * i + 1 for i in range(self.MAX_ROW_SIZE)))
+
         self.observation_space = spaces.Dict({
-            'multiplier': spaces.Discrete(1),
-            'gate_closed': spaces.Discrete(1),
-            'remaining_cards': spaces.MultiDiscrete([1] * _Deck.N_CARD_TYPES),
+            'multiplier': spaces.Box(0, 8, dtype=int),
+            'gate_closed': spaces.Box(0, 1, dtype=int),
+            'remaining_cards': spaces.Tuple(spaces.Box(0, c, dtype=int) for c in self._deck.cards_set),
             'current_row': spaces.Tuple(spaces.MultiBinary(_Deck.N_CARD_TYPES)
-                                        for _ in range(self.MAX_ROW_SIZE))
+                                        for _ in range(self.MAX_ROW_SIZE)),
+            'current_prize': spaces.Box(*self.reward_range, dtype=int),
+            'turn': spaces.Box(0, self.N_ROWS - 2, dtype=int),
+            'chance_to_bust': spaces.Box(0, 1),
         })
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self._i_round = 0
-        self._new_round()
-
-        return self._observed_state
-
-    def _new_round(self):
         self._deck.shuffle(self.np_random)
 
         self._rows = 8 * [[]]
@@ -118,36 +106,20 @@ class Game(gym.Env):
         else:
             self._multiplier = 1
 
-        self._prev_reward = self.reward_if_stop
-        self._reward_given = 15
+        return self._observed_state, {}
 
     def step(self, action):
         def stop():
-            self._i_round += 1
-            reward = 0 if self._training_reward else self.reward_if_stop - 15
-
-            res = self._observed_state, reward, self._game_over, {}
-            self._new_round()
-            return res
+            return self._observed_state, self.reward_if_stop - 15, True, False, {}
 
         def bust():
-            self._i_round += 1
-            reward = -15
-
-            out = self._observed_state, reward, self._game_over, {}
-            self._new_round()
-            return out
+            return self._observed_state, -15, True, False, {}
 
         def success():
             if self._i_row == self.N_ROWS:
                 return stop()
 
-            reward = self.reward_if_stop - self._prev_reward if self._training_reward else 0
-
-            self._prev_reward = self.reward_if_stop
-            self._reward_given += reward
-
-            return self._observed_state, reward, False, {}
+            return self._observed_state, 0, False, False, {}
 
         if not action:
             return stop()
@@ -162,13 +134,13 @@ class Game(gym.Env):
             return success()
 
         if r.count(r[0]) == len(r):
-            self.multiplier = len(r)
+            self._multiplier = len(r)
             return success()
 
         for i in range(len(pr)):
             for j in range(i, i + 2):
                 if r[j] == pr[i]:
-                    if not self._rows[0] or self._rows[0][0] == r[j] or i and self._rows[0][0] == pr[i-1]:
+                    if not self._rows[0] or self._rows[0][0] == r[j] or i and self._rows[0][0] == pr[i]:
                         return bust()
                     r[j] = self._rows[0][0]
                     self._rows[0] = []
@@ -184,12 +156,12 @@ class Game(gym.Env):
         return '\n'.join([out] + [str(r) for r in self._rows[1:] if r])
 
     @property
-    def gate_closed(self):
-        return self._rows[0]
+    def i_row(self):
+        return self._i_row
 
     @property
-    def _game_over(self):
-        return self._i_round >= self._n_rounds
+    def gate_closed(self):
+        return self._rows[0]
 
     @property
     def deck(self):
@@ -197,7 +169,7 @@ class Game(gym.Env):
 
     @property
     def reward_if_stop(self):
-        if self._i_row == self.N_ROWS and not self._disable_jackpot:
+        if self._i_row == self.N_ROWS:
             return self._multiplier * sum(sum(r) for r in self._rows[1:])
         else:
             return self._multiplier * sum(self._current_row)
@@ -205,6 +177,20 @@ class Game(gym.Env):
     @property
     def _current_row(self):
         return self._rows[self._i_row - 1]
+
+    @property
+    def _chance_of_misfortune(self):
+        c = self._deck.remaining_cards
+        r = self._current_row
+
+        nc = len(c)
+        p_hero = self._i_row * c.count(0) / nc
+
+        res = c.count(r[0]) * bool(r[0]) + c.count(r[-1]) * bool(r[-1])
+        for i in range(0, len(r) - 1):
+            res += c.count([i]) * bool(r[i]) + c.count(r[i+1]) * bool(r[i+1])
+
+        return (res / nc) * (1 - p_hero)
 
     @property
     def _observed_state(self):
@@ -218,26 +204,33 @@ class Game(gym.Env):
             er[i][c] = 1
 
         return {
-            'multiplier': self._multiplier,
-            'gate_closed': len(self._rows[0]),
+            'multiplier': [self._multiplier],
+            'gate_closed': [len(self._rows[0])],
             'remaining_cards': [rc.count(i) for i in range(_Deck.N_CARD_TYPES)],
-            'current_row': np.concatenate(er),
+            'current_row': er,
+            'current_prize': self.reward_if_stop,
+            'turn': self._i_row - 2,
+            'chance_to_bust': self._chance_of_misfortune
         }
 
 
 class GameWithCustomInput(Game):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, n_rounds=1, **kwargs)
+    def __init__(self, *args, wrapper=id, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._wrapped = wrapper(self)
 
-    def reset(self, row):
+    def c_reset(self, row):
         assert len(row) == 2
 
         self._deck.disable_shuffling = True
         self._deck.shuffle()
         self._deck.move_sequence_forward([0] + row)
-        return super().reset()
+        return self._wrapped.reset()
 
-    def step(self, action, new_row, gate):
+    def c_step(self, action, new_row, gate):
+        if not new_row:
+            return self._wrapped.step(action)
+
         assert len(new_row) == self._i_row + 1
 
         if self.gate_closed:
@@ -252,42 +245,18 @@ class GameWithCustomInput(Game):
 
         self._deck.move_sequence_forward(new_row)
 
-        return super().step(action)
-
-
-class Processor(rl.core.Processor):
-    def __init__(self, env):
-        super().__init__()
-        self._obs_shape = flatten_space(env.observation_space).shape
-        self._normalizer = 1 / np.array([
-            [env.MAX_ROW_SIZE, 1]
-            + env.deck.cards_set
-            + [1] *
-            flatten_space(env.observation_space['current_row']).shape[0]
-        ], dtype=np.float32)
-        self._normalizer = np.squeeze(self._normalizer)
-
-    def process_observation(self, observation):
-        obs = np.zeros(shape=self._obs_shape, dtype=np.float32)
-        obs[0] = observation['multiplier']
-        obs[1] = observation['gate_closed']
-        obs[2:2+_Deck.N_CARD_TYPES] = observation['remaining_cards']
-        obs[2 +
-            _Deck.N_CARD_TYPES:] = np.array(observation['current_row']).flatten()
-        return obs * self._normalizer
-
-    # def process_state_batch(self, batch):
-    #     return batch.reshape((1, -1))
-        # if len(batch.shape) > 1:
-        #     return np.squeeze(batch, axis=0)
-        # return np.reshape(batch, (1, -1))
+        return self._wrapped.step(action)
 
 
 class Adviser:
-    def __init__(self, agent: rl.core.Agent, env: GameWithCustomInput):
-        self._agent = agent
+    def __init__(self, env: GameWithCustomInput, file):
         self._env = env
         self._action = 0
+
+        self._policy = create_policy(env._wrapped)
+        self._policy.load_state_dict(torch.load(file))
+        self._policy.eval()
+
         self.reset()
 
     def reset(self):
@@ -295,9 +264,10 @@ class Adviser:
             try:
                 print('\n\nNew round\n')
                 cards = input('Enter 2 cards: ')
-                self._observation = self._env.reset([int(c) for c in cards])
-                self._action = self._agent.forward(
-                    self._agent.processor.process_observation(self._observation))
+                self._observation, _ = self._env.c_reset(
+                    [int(c) for c in cards])
+                self._action = self._policy.forward(ts.data.Batch(
+                    obs=np.expand_dims(self._observation, 0), info={}))['act'][0]
                 break
             except KeyboardInterrupt:
                 return
@@ -306,145 +276,165 @@ class Adviser:
 
     def step(self):
         while True:
+            print('Game state:\n', self._env.render(), '\n')
+            print('Reward if stop:', self._env.reward_if_stop)
             print('Advised acton: ', self._action)
             try:
                 cards = input(
-                    f'Enter {self._env._i_row + 1} cards of nothing to reset: ')
+                    f'Enter {self._env.i_row + 1} cards of nothing to reset: ')
                 if not cards:
-                    self.reset()
-                    continue
+                    action = 0
 
-                assert len(cards) == self._env._i_row + 1
-                cards = [int(c) for c in cards]
+                else:
+                    action = 1
+                    assert len(cards) == self._env.i_row + 1
+                    cards = [int(c) for c in cards]
 
-                gate = self._env.gate_closed
-                if self._env.gate_closed:
-                    gate = input(
-                        f'Enter exposed gate card or enter nothing if gate card was not exposed: ')
-                    if gate:
-                        gate = int(gate)
-                    else:
-                        gate = None
+                    gate = None
+                    if self._env.gate_closed:
+                        gate = input(
+                            f'Enter exposed gate card or enter nothing if gate card was not exposed: ')
+                        if gate:
+                            gate = int(gate)
+                        else:
+                            gate = None
 
-                self._observation, reward, terminated, _ = self._env.step(
-                    self._action, cards, gate)
-
-                print('Reward for step: ', reward)
-                print('Reward if hold ', self._env.reward_if_stop)
+                self._observation, reward, terminated, _, _ = self._env.c_step(
+                    action, cards, gate)
 
                 if terminated:
+                    print('Reward: ', reward)
                     self.reset()
                     continue
 
-                print('Game state:\n', self._env.render(), '\n')
-
-                self._action = self._agent.forward(
-                    self._agent.processor.process_observation(self._observation))
+                self._action = self._policy.forward(
+                    ts.data.Batch(obs=np.expand_dims(self._observation, 0), info={}))['act'][0]
             except KeyboardInterrupt:
                 return
             except:
                 print(traceback.format_exc(), '\n\n')
 
 
-def create_agent(env):
-    nb_actions = env.action_space.n
+def normalize_env(env):
+    return NormalizeObservation(FlattenObservation(env))
 
-    model = keras.Sequential()
-    model.add(keras.layers.Flatten(input_shape=(1,) + flatten_space(env.observation_space).shape))
-    model.add(keras.layers.Dense(140))
-    model.add(keras.layers.Activation('relu'))
-    model.add(keras.layers.Dense(70))
-    model.add(keras.layers.Activation('relu'))
-    model.add(keras.layers.Dense(30))
-    model.add(keras.layers.Activation('relu'))
-    model.add(keras.layers.Dense(nb_actions))
-    model.add(keras.layers.Activation('softmax'))
 
-    processor = Processor(env)
-
-    # agt = rl.agents.SARSAAgent(
-    #     model=model,
-    #     processor=processor,
-    #     nb_actions=nb_actions,
-    #     train_interval=10,
-    # )
-    # agt.compile(keras.optimizers.Adam())
-
-    agt = rl.agents.DQNAgent(
-        model=model,
-        processor=processor,
-        memory=rl.memory.SequentialMemory(limit=50000, window_length=1),
-        batch_size=50,
-        nb_actions=nb_actions,
-        nb_steps_warmup=10,
-        train_interval=1000,
-        memory_interval=2,
-        policy=rl.policy.BoltzmannQPolicy(),
-        enable_double_dqn=True,
-        enable_dueling_network=True,
+def create_policy(env):
+    net = Net(
+        state_shape=env.observation_space.shape or env.observation_space.n,
+        action_shape=env.action_space.shape or env.action_space.n,
+        hidden_sizes=[10],
     )
-    agt.compile(keras.optimizers.Adam(lr=1e-3), metrics=['mae'])
 
-    return agt
+    optim = torch.optim.Adam(net.parameters(), lr=1e-3)
 
-
-def _consult():
-    deck_type = input(
-        'Enter deck type ("Emerald", "Ruby", "Diamond", or nothing for "Emerald"): ')
-    env = GameWithCustomInput(deck_type if deck_type else 'Emerald')
-    agt = create_agent(env)
-    agt.load_weights('fortune_tower_params.h5f')
-
-    agt.reset_states()
-
-    adv = Adviser(agt, env)
-    adv.step()
+    return ts.policy.DQNPolicy(
+        model=net,
+        optim=optim,
+        discount_factor=.9,
+        action_space=env.action_space,
+        estimation_step=100,
+    )
 
 
 def _train():
-    env = Game('Emerald', n_rounds=5000,
-               disable_jackpot=False, training_reward=True)
+    type = 'Diamond'
 
-    agt = create_agent(env)
+    train_envs = ts.env.DummyVectorEnv(
+        [lambda: normalize_env(Game(type)) for _ in range(10)])
+    test_envs = ts.env.DummyVectorEnv(
+        [lambda: normalize_env(Game(type)) for _ in range(10)])
+
+    policy = create_policy(normalize_env(Game(type)))
 
     try:
-        agt.load_weights('fortune_tower_params.h5f')
+        policy.load_state_dict(torch.load('dqn.pth'))
     except:
         pass
 
-    agt.fit(env,
-            nb_steps=1000000,
-            visualize=False,
-            verbose=2,
-            log_interval=None)
-    agt.save_weights('fortune_tower_params.h5f', overwrite=True)
+    train_collector = ts.data.Collector(
+        policy, train_envs, ts.data.VectorReplayBuffer(20000, 10), exploration_noise=True)
+    test_collector = ts.data.Collector(
+        policy, test_envs, exploration_noise=True)
+
+    def save(epoch, env_step, gradient_step):
+        n = f'checkpoints/{epoch}_{env_step}_{gradient_step}.pth'
+        torch.save(policy.state_dict(), n)
+        return n
+
+    result = ts.trainer.OffpolicyTrainer(
+        policy=policy,
+        train_collector=train_collector,
+        test_collector=test_collector,
+        max_epoch=150,
+        step_per_epoch=10000,
+        step_per_collect=1000,
+        episode_per_test=10000,
+        batch_size=256,
+        stop_fn=lambda mean_rewards: mean_rewards >= 5,
+        train_fn=lambda epoch, env_step: policy.set_eps(.2),
+        test_fn=lambda epoch, env_step: policy.set_eps(0),
+        logger=ts.utils.TensorboardLogger(SummaryWriter('log/dqn')),
+        resume_from_log=True,
+        save_checkpoint_fn=save,
+    ).run()
+
+    print(f'Finished training! Use {result["duration"]}')
+    torch.save(policy.state_dict(), 'dqn.pth')
 
 
 def _test():
     N = 10000
-    env = Game(n_rounds=N, training_reward=False)
+    env = normalize_env(Game('Ruby'))
     env.reset(seed=1)
 
-    agt = create_agent(env)
-    agt.load_weights('fortune_tower_params.h5f')
-    agt.reset_states()
+    policy = create_policy(env)
+    policy.load_state_dict(torch.load('dqn_ruby.pth'))
+    policy.eval()
 
     total_reward = 0
-    obs = env.reset()
-    finished = False
+
     total_act = 0
     total_steps = 0
-    while not finished:
-        # print(env.render())
-        act = agt.forward(agt.processor.process_observation(obs))
-        total_act += act
-        total_steps += 1
-        obs, reward, finished, _ = env.step(act)
-        total_reward += reward
-        # print(f'Got reward: {reward}\n')
+    total_length = 0
+    total_jackpots = 0
+    for _ in range(N):
+        obs = env.reset()[0]
+        finished = False
+        length = 0
+        while not finished:
+            # print(env.render())
+            act = policy.forward(ts.data.Batch(
+                obs=np.expand_dims(obs, 0), info={}))['act'][0]
+            total_act += act
+            total_steps += 1
+            length += 1
+            obs, reward, finished, _, _ = env.step(act)
+            total_reward += reward
+            if env.unwrapped._i_row == env.unwrapped.N_ROWS and reward > 0:
+                total_jackpots += 1
+            # print(f'Got reward: {reward}\n')
+
+        total_length += length
 
     print(f'Average reward {total_reward / N}')
     print(f'Average action {total_act / total_steps}')
+    print(f'Average length {total_length / N}')
+    print(f'Jackpots {total_jackpots}')
+
+
+def _consult():
+    deck_type = input(
+        'Enter deck type ("Ruby", "Emerald", "Diamond", or nothing for "Ruby"): ')
+    deck_type = deck_type if deck_type else 'Emerald'
+
+    env = GameWithCustomInput(deck_type, wrapper=normalize_env)
+
+    files = {'Emerald': 'dqn_emerald.pth',
+             'Ruby': 'dqn_ruby.pth', 'Diamond': 'dqn_diamond.pth'}
+
+    adv = Adviser(env, files[deck_type])
+    adv.step()
 
 
 def _main():

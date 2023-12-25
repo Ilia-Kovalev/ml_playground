@@ -1,7 +1,1 @@
-# requirements.txt
-Keras==2.1.6
-gymnasium==0.28.1
-keras-rl==0.4.2
-tensorflow==1.13.2
-protobuf==3.20.3
-h5py==2.10.0
+tianshou==0.5.1
